@@ -1,0 +1,18 @@
+# Your Twitch username
+username = "your-twitch-username"
+
+# Channels to farm. Order = priority
+# (Twitch only credits watch time for 2 channels at once)
+streamers = ["streamer1", "streamer2"]
+
+# Also farm every channel you follow (appended after the list above)
+followers = false
+
+# Never farm these channels
+blacklist = []
+
+# Optional, all default to true:
+# follow_raids  = true   # join raids
+# claim_moments = true   # claim moments
+# watch_streak  = true   # prefer channels whose watch streak is still missing
+# claim_drops   = true   # claim finished drops from your inventory

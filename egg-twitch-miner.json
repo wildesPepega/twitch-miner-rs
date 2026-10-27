@@ -1,0 +1,122 @@
+{
+    "_comment": "DO NOT EDIT: FILE GENERATED AUTOMATICALLY BY PTERODACTYL PANEL - PTERODACTYL.IO",
+    "meta": {
+        "version": "PTDL_v2",
+        "update_url": "https://raw.githubusercontent.com/wildesPepega/twitch-miner-rs/main/egg-twitch-miner.json"
+    },
+    "exported_at": "2026-10-27T00:00:00+00:00",
+    "name": "Twitch Miner",
+    "author": "wildesPepega@users.noreply.github.com",
+    "description": "Lightweight Twitch channel points miner: watches streams, claims bonus chests, drops and moments, joins raids. On first start, open https://www.twitch.tv/activate and enter the code shown in the console.",
+    "features": null,
+    "docker_images": {
+        "Debian": "ghcr.io/parkervcp/yolks:debian"
+    },
+    "file_denylist": [],
+    "startup": "./twitch-miner",
+    "config": {
+        "files": "{}",
+        "startup": "{\"done\": [\"Miner running\", \"enter this code\"]}",
+        "logs": "{}",
+        "stop": "^C"
+    },
+    "scripts": {
+        "installation": {
+            "script": "#!/bin/bash\n# Downloads the prebuilt twitch-miner binary from GitHub releases\nset -e\ncd /mnt/server\n\ncase \"$(uname -m)\" in\n  x86_64) ARCH=x86_64 ;;\n  aarch64|arm64) ARCH=aarch64 ;;\n  *) echo \"Unsupported architecture: $(uname -m)\"; exit 1 ;;\nesac\n\nREPO=\"wildesPepega/twitch-miner-rs\"\nif [ -z \"${VERSION}\" ] || [ \"${VERSION}\" = \"latest\" ]; then\n  URL=\"https://github.com/${REPO}/releases/latest/download/twitch-miner-linux-${ARCH}\"\nelse\n  URL=\"https://github.com/${REPO}/releases/download/${VERSION}/twitch-miner-linux-${ARCH}\"\nfi\n\necho \"Downloading ${URL}\"\ncurl -fsSL -o twitch-miner \"${URL}\"\nchmod +x twitch-miner\necho \"Installation complete\"\n",
+            "container": "ghcr.io/parkervcp/installers:debian",
+            "entrypoint": "bash"
+        }
+    },
+    "variables": [
+        {
+            "name": "Twitch Username",
+            "description": "Your Twitch username.",
+            "env_variable": "TWITCH_USERNAME",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|max:25",
+            "field_type": "text"
+        },
+        {
+            "name": "Streamers",
+            "description": "Channels to farm, comma separated. Order = priority.",
+            "env_variable": "STREAMERS",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:2000",
+            "field_type": "text"
+        },
+        {
+            "name": "Farm Followed Channels",
+            "description": "Also farm every channel you follow.",
+            "env_variable": "FOLLOWERS",
+            "default_value": "false",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|in:true,false",
+            "field_type": "text"
+        },
+        {
+            "name": "Blacklist",
+            "description": "Channels to never farm, comma separated.",
+            "env_variable": "BLACKLIST",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:2000",
+            "field_type": "text"
+        },
+        {
+            "name": "Follow Raids",
+            "description": "Join raids.",
+            "env_variable": "FOLLOW_RAIDS",
+            "default_value": "true",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|in:true,false",
+            "field_type": "text"
+        },
+        {
+            "name": "Claim Moments",
+            "description": "Claim moments.",
+            "env_variable": "CLAIM_MOMENTS",
+            "default_value": "true",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|in:true,false",
+            "field_type": "text"
+        },
+        {
+            "name": "Watch Streak",
+            "description": "Prefer channels whose watch streak is still missing.",
+            "env_variable": "WATCH_STREAK",
+            "default_value": "true",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|in:true,false",
+            "field_type": "text"
+        },
+        {
+            "name": "Claim Drops",
+            "description": "Claim finished drops from your inventory.",
+            "env_variable": "CLAIM_DROPS",
+            "default_value": "true",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|in:true,false",
+            "field_type": "text"
+        },
+        {
+            "name": "Version",
+            "description": "Release tag to install, e.g. v0.1.0, or 'latest'. Reinstall the server to update.",
+            "env_variable": "VERSION",
+            "default_value": "latest",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|max:20",
+            "field_type": "text"
+        }
+    ]
+}

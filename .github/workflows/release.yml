@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            asset: twitch-miner-linux-x86_64
+          - os: ubuntu-22.04-arm
+            asset: twitch-miner-linux-aarch64
+          - os: windows-latest
+            asset: twitch-miner-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - name: Rename binary
+        shell: bash
+        run: |
+          bin=target/release/twitch-miner
+          [ "$RUNNER_OS" = "Windows" ] && bin="$bin.exe"
+          mkdir dist
+          cp "$bin" "dist/${{ matrix.asset }}"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
