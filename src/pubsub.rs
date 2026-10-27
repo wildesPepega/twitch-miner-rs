@@ -21,7 +21,7 @@ pub fn topics(miner: &Miner) -> Vec<String> {
         t.push(format!("user-drop-events.{}", miner.api.user_id));
     }
     for s in &miner.streamers {
-        let id = s.lock().unwrap().channel_id.clone();
+        let id = &s.channel_id;
         t.push(format!("video-playback-by-id.{id}"));
         if miner.cfg.follow_raids {
             t.push(format!("raid.{id}"));
@@ -130,7 +130,7 @@ fn handle(miner: &Arc<Miner>, topic: &str, msg: Value) {
             && let Some(id) = data["drop_instance_id"].as_str()
         {
             let (m, id) = (miner.clone(), id.to_owned());
-            tokio::spawn(async move { m.claim_drop(&id, "from live event").await });
+            tokio::spawn(async move { m.claim_drop(id, "from live event".into()).await });
         }
         return;
     }
@@ -161,23 +161,17 @@ fn handle(miner: &Arc<Miner>, topic: &str, msg: Value) {
         ("community-points-user-v1", "claim-available") => {
             if let Some(id) = data["claim"]["id"].as_str() {
                 let (m, id) = (miner.clone(), id.to_owned());
-                tokio::spawn(async move { m.claim_bonus(i, &id).await });
+                tokio::spawn(async move { m.claim_bonus(i, id).await });
             }
         }
         ("video-playback-by-id", "stream-up") => {
-            miner.streamers[i].lock().unwrap().stream_up_at = Some(Instant::now());
+            miner.set_stream_up(i);
         }
         ("video-playback-by-id", "stream-down") => {
             miner.set_offline(i);
         }
         ("video-playback-by-id", "viewcount") => {
-            // stream-up arrives before the API knows the stream; give it two minutes
-            let ready = miner.streamers[i]
-                .lock()
-                .unwrap()
-                .stream_up_at
-                .is_none_or(|t| t.elapsed() > Duration::from_secs(120));
-            if ready {
+            if miner.stream_ready(i) {
                 let m = miner.clone();
                 tokio::spawn(async move { m.check_online(i).await });
             }
@@ -186,13 +180,13 @@ fn handle(miner: &Arc<Miner>, topic: &str, msg: Value) {
             let raid = &msg["raid"];
             if let (Some(id), Some(target)) = (raid["id"].as_str(), raid["target_login"].as_str()) {
                 let (m, id, target) = (miner.clone(), id.to_owned(), target.to_owned());
-                tokio::spawn(async move { m.join_raid(i, &id, &target).await });
+                tokio::spawn(async move { m.join_raid(i, id, target).await });
             }
         }
         ("community-moments-channel-v1", "active") => {
             if let Some(id) = data["moment_id"].as_str() {
                 let (m, id) = (miner.clone(), id.to_owned());
-                tokio::spawn(async move { m.claim_moment(i, &id).await });
+                tokio::spawn(async move { m.claim_moment(i, id).await });
             }
         }
         _ => {}

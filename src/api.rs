@@ -4,8 +4,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, RwLock};
+use std::sync::{LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::log;
@@ -14,6 +15,10 @@ pub const CLIENT_ID: &str = "ue6666qo983tsx6so1t0vnawi233wa"; // Android TV
 const DEFAULT_CLIENT_VERSION: &str = "ef928475-9403-42f2-8a34-55784bd08e16";
 const GQL_URL: &str = "https://gql.twitch.tv/gql";
 const TV_UA: &str = "Mozilla/5.0 (Linux; Android 7.1; Smart Box C1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36";
+/// Operations per batched GQL request
+const BATCH_SIZE: usize = 20;
+/// How long a stream's media playlist URL is reused before requesting a new access token
+const PLAYLIST_TTL: Duration = Duration::from_secs(5 * 60);
 const BROWSER_UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:85.0) Gecko/20100101 Firefox/85.0";
 
 /// Persisted GQL query: (operationName, sha256Hash).
@@ -79,8 +84,10 @@ pub struct Twitch {
     pub user_id: String,
     device_id: String,
     session_id: String,
-    client_version: RwLock<(String, Option<Instant>)>,
+    client_version: RwLock<String>,
     spade_url: RwLock<Option<String>>,
+    /// login -> (media playlist URL, fetched at)
+    playlists: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 pub fn random_string(len: usize, charset: &[u8]) -> String {
@@ -101,109 +108,119 @@ impl Twitch {
         let device_id = random_string(32, ALNUM);
         let token_path = PathBuf::from(format!("{username}.token.json"));
 
-        let mut token = std::fs::read_to_string(&token_path)
+        let saved = std::fs::read_to_string(&token_path)
             .ok()
             .and_then(|s| serde_json::from_str::<TokenFile>(&s).ok())
             .map(|t| t.auth_token);
 
-        let user_id = loop {
-            let t = match token.take() {
-                Some(t) => t,
-                None => {
-                    let t = device_login(&http, &device_id).await?;
-                    save_token(&token_path, &t)?;
-                    t
-                }
-            };
-            match validate(&http, &t).await? {
-                Some((login, id)) => {
-                    if login != username {
-                        log!("Warning: token belongs to '{login}', not '{username}'");
+        let auth = async {
+            let mut token = saved;
+            loop {
+                let t = match token.take() {
+                    Some(t) => t,
+                    None => {
+                        let t = device_login(&http, &device_id).await?;
+                        save_token(&token_path, &t)?;
+                        t
                     }
-                    token = Some(t);
-                    break id;
-                }
-                None => {
-                    log!("Saved token is invalid, logging in again");
-                    let _ = std::fs::remove_file(&token_path);
+                };
+                match validate(&http, &t).await? {
+                    Some((login, id)) => {
+                        if login != username {
+                            log!("Warning: token belongs to '{login}', not '{username}'");
+                        }
+                        return Ok::<_, anyhow::Error>((t, id));
+                    }
+                    None => {
+                        log!("Saved token is invalid, logging in again");
+                        let _ = std::fs::remove_file(&token_path);
+                    }
                 }
             }
         };
+        let (auth, client_version) = tokio::join!(auth, fetch_client_version(&http));
+        let (token, user_id) = auth?;
 
         Ok(Self {
             http,
-            token: token.unwrap(),
+            token,
             user_id,
             device_id,
             session_id: random_string(32, HEX),
-            client_version: RwLock::new((DEFAULT_CLIENT_VERSION.into(), None)),
+            client_version: RwLock::new(
+                client_version.unwrap_or_else(|| DEFAULT_CLIENT_VERSION.into()),
+            ),
             spade_url: RwLock::new(None),
+            playlists: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Twitch wants a recent web build id as Client-Version; refreshed hourly.
-    async fn client_version(&self) -> String {
-        {
-            let cv = self.client_version.read().unwrap();
-            if cv
-                .1
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(3600))
-            {
-                return cv.0.clone();
-            }
+    /// Twitch wants a recent web build id as Client-Version; call this periodically.
+    pub async fn refresh_client_version(&self) {
+        if let Some(v) = fetch_client_version(&self.http).await {
+            *self.client_version.write().unwrap() = v;
         }
-        let fetched = async {
-            let html = self
-                .http
-                .get("https://www.twitch.tv")
-                .send()
-                .await
-                .ok()?
-                .text()
-                .await
-                .ok()?;
-            Some(BUILD_ID_RE.captures(&html)?[1].to_string())
-        }
-        .await;
-        let mut cv = self.client_version.write().unwrap();
-        if let Some(v) = fetched {
-            cv.0 = v;
-        }
-        cv.1 = Some(Instant::now());
-        cv.0.clone()
     }
 
-    pub async fn gql(&self, op: &Op, variables: Value) -> Result<Value> {
-        let body = json!({
-            "operationName": op.0,
-            "variables": variables,
-            "extensions": {"persistedQuery": {"version": 1, "sha256Hash": op.1}},
-        });
-        let resp: Value = self
+    async fn post_gql(&self, body: &Value) -> Result<Value> {
+        let client_version = self.client_version.read().unwrap().clone();
+        Ok(self
             .http
             .post(GQL_URL)
             .header("Authorization", format!("OAuth {}", self.token))
             .header("Client-Id", CLIENT_ID)
             .header("Client-Session-Id", &self.session_id)
-            .header("Client-Version", self.client_version().await)
+            .header("Client-Version", client_version)
             .header("User-Agent", TV_UA)
             .header("X-Device-Id", &self.device_id)
-            .json(&body)
+            .json(body)
             .send()
-            .await
-            .with_context(|| format!("GQL {}", op.0))?
+            .await?
             .json()
+            .await?)
+    }
+
+    pub async fn gql(&self, op: &Op, variables: Value) -> Result<Value> {
+        let resp = self
+            .post_gql(&gql_body(op, variables))
             .await
-            .with_context(|| format!("GQL {} response", op.0))?;
+            .with_context(|| format!("GQL {}", op.0))?;
         if resp.get("data").is_none_or(Value::is_null) {
             bail!("GQL {} failed: {resp}", op.0);
         }
         Ok(resp)
     }
 
-    pub async fn channel_id(&self, login: &str) -> Result<Option<String>> {
-        let r = self.gql(&ID_FROM_LOGIN, json!({"login": login})).await?;
-        Ok(r["data"]["user"]["id"].as_str().map(str::to_owned))
+    /// Sends many operations in parallel batches. Results keep the input order;
+    /// a failed operation yields a response without `data`.
+    pub async fn gql_batch(&self, reqs: Vec<(&Op, Value)>) -> Result<Vec<Value>> {
+        let bodies: Vec<Value> = reqs.into_iter().map(|(op, v)| gql_body(op, v)).collect();
+        let batches = bodies.chunks(BATCH_SIZE).map(|chunk| async move {
+            match self
+                .post_gql(&Value::from(chunk))
+                .await
+                .context("GQL batch")?
+            {
+                Value::Array(a) if a.len() == chunk.len() => Ok(a),
+                other => bail!("Unexpected GQL batch response: {other}"),
+            }
+        });
+        let results = futures_util::future::try_join_all(batches).await?;
+        Ok(results.into_iter().flatten().collect())
+    }
+
+    /// Resolves logins to channel ids; None for logins that do not exist.
+    pub async fn channel_ids(&self, logins: &[String]) -> Result<Vec<Option<String>>> {
+        let reqs = logins
+            .iter()
+            .map(|l| (&ID_FROM_LOGIN, json!({"login": l})))
+            .collect();
+        Ok(self
+            .gql_batch(reqs)
+            .await?
+            .iter()
+            .map(|r| r["data"]["user"]["id"].as_str().map(str::to_owned))
+            .collect())
     }
 
     pub async fn followers(&self) -> Result<Vec<String>> {
@@ -275,8 +292,45 @@ impl Twitch {
         *self.spade_url.write().unwrap() = None;
     }
 
-    /// Fetches the HLS playlist and requests the newest segment, like a real player would.
+    /// Requests the newest stream segment, like a real player would.
     pub async fn touch_stream(&self, login: &str) -> Result<()> {
+        let cached = self
+            .playlists
+            .lock()
+            .unwrap()
+            .get(login)
+            .filter(|(_, at)| at.elapsed() < PLAYLIST_TTL)
+            .map(|(url, _)| url.clone());
+        if let Some(url) = cached {
+            if self.head_newest_segment(&url).await.is_ok() {
+                return Ok(());
+            }
+            self.playlists.lock().unwrap().remove(login);
+        }
+        let url = self.media_playlist(login).await?;
+        self.head_newest_segment(&url).await?;
+        self.playlists
+            .lock()
+            .unwrap()
+            .insert(login.to_owned(), (url, Instant::now()));
+        Ok(())
+    }
+
+    async fn get_text(&self, url: &str, query: &[(&str, &str)]) -> Result<String> {
+        Ok(self
+            .http
+            .get(url)
+            .query(query)
+            .header("User-Agent", TV_UA)
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?)
+    }
+
+    /// Gets a playback token and returns the lowest quality media playlist URL.
+    async fn media_playlist(&self, login: &str) -> Result<String> {
         let r = self
             .gql(
                 &PLAYBACK_ACCESS_TOKEN,
@@ -290,30 +344,20 @@ impl Twitch {
         let (Some(sig), Some(value)) = (pat["signature"].as_str(), pat["value"].as_str()) else {
             bail!("No PlaybackAccessToken for {login}");
         };
-
         let master = self
-            .http
-            .get(format!(
-                "https://usher.ttvnw.net/api/channel/hls/{login}.m3u8"
-            ))
-            .query(&[("sig", sig), ("token", value)])
-            .header("User-Agent", TV_UA)
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
+            .get_text(
+                &format!("https://usher.ttvnw.net/api/channel/hls/{login}.m3u8"),
+                &[("sig", sig), ("token", value)],
+            )
             .await?;
         // The last variant in the master playlist is the lowest quality.
-        let variant = last_url(&master).ok_or_else(|| anyhow!("No stream variant"))?;
-        let media = self
-            .http
-            .get(variant)
-            .header("User-Agent", TV_UA)
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
+        Ok(last_url(&master)
+            .ok_or_else(|| anyhow!("No stream variant"))?
+            .to_owned())
+    }
+
+    async fn head_newest_segment(&self, playlist_url: &str) -> Result<()> {
+        let media = self.get_text(playlist_url, &[]).await?;
         let segment = last_url(&media).ok_or_else(|| anyhow!("No stream segment"))?;
         self.http
             .head(segment)
@@ -336,6 +380,26 @@ impl Twitch {
             .await?;
         Ok(resp.status() == reqwest::StatusCode::NO_CONTENT)
     }
+}
+
+fn gql_body(op: &Op, variables: Value) -> Value {
+    json!({
+        "operationName": op.0,
+        "variables": variables,
+        "extensions": {"persistedQuery": {"version": 1, "sha256Hash": op.1}},
+    })
+}
+
+async fn fetch_client_version(http: &reqwest::Client) -> Option<String> {
+    let html = http
+        .get("https://www.twitch.tv")
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    Some(BUILD_ID_RE.captures(&html)?[1].to_string())
 }
 
 fn last_url(playlist: &str) -> Option<&str> {

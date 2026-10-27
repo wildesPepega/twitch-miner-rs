@@ -1,10 +1,11 @@
 //! Streamer state and all point-earning actions.
 
 use anyhow::Result;
+use futures_util::future::join_all;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::api::{self, Twitch};
@@ -14,10 +15,14 @@ use crate::log;
 /// Twitch only credits watch time for two channels at the same time.
 const MAX_WATCHING: usize = 2;
 
-#[derive(Default)]
 pub struct Streamer {
     pub login: String,
     pub channel_id: String,
+    state: Mutex<State>,
+}
+
+#[derive(Default)]
+pub struct State {
     pub points: i64,
     pub start_points: i64,
     pub online: bool,
@@ -36,6 +41,20 @@ pub struct Streamer {
     pub history: BTreeMap<String, (u32, i64)>,
 }
 
+impl Streamer {
+    pub fn new(login: String, channel_id: String) -> Self {
+        Self {
+            login,
+            channel_id,
+            state: Mutex::default(),
+        }
+    }
+
+    pub fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap()
+    }
+}
+
 /// 1234567 -> "1,234,567"
 pub fn fmt_points(n: i64) -> String {
     let digits = n.unsigned_abs().to_string();
@@ -49,6 +68,14 @@ pub fn fmt_points(n: i64) -> String {
     if n < 0 { format!("-{out}") } else { out }
 }
 
+fn fmt_signed(n: i64) -> String {
+    if n >= 0 {
+        format!("+{}", fmt_points(n))
+    } else {
+        fmt_points(n)
+    }
+}
+
 /// Human readable source of a point gain.
 fn reason_text(code: &str) -> String {
     match code {
@@ -60,107 +87,110 @@ fn reason_text(code: &str) -> String {
     }
 }
 
-impl Streamer {
+impl State {
     fn game_name(&self) -> &str {
         self.game.as_ref().map_or("unknown game", |g| g.1.as_str())
     }
-
-    fn set_online(&mut self, announce: bool) {
-        if !self.online {
-            self.online = true;
-            self.online_at = Some(Instant::now());
-            self.watch_streak_missing = true;
-            self.minutes_watched = 0.0;
-            self.last_watch = None;
-            if announce {
-                log!(
-                    "ONLINE   {} is now live ({}) - {} points",
-                    self.login,
-                    self.game_name(),
-                    fmt_points(self.points)
-                );
-            }
-        }
-    }
-
-    fn set_offline(&mut self, announce: bool) {
-        if self.online {
-            self.online = false;
-            self.offline_at = Some(Instant::now());
-            if announce {
-                log!(
-                    "OFFLINE  {} went offline - {} points",
-                    self.login,
-                    fmt_points(self.points)
-                );
-            }
-        }
-    }
-}
-
-pub struct Miner {
-    pub api: Twitch,
-    pub cfg: Config,
-    pub streamers: Vec<Mutex<Streamer>>,
-    /// Status changes are only announced after the startup overview
-    pub started: AtomicBool,
 }
 
 fn elapsed(t: Option<Instant>) -> Option<Duration> {
     t.map(|t| t.elapsed())
 }
 
+pub struct Miner {
+    pub api: Twitch,
+    pub cfg: Config,
+    pub streamers: Vec<Streamer>,
+    /// channel id -> index into `streamers`
+    index: HashMap<String, usize>,
+    /// Status changes are only announced after the startup overview
+    started: AtomicBool,
+}
+
 impl Miner {
-    pub fn find(&self, channel_id: &str) -> Option<usize> {
-        self.streamers
+    pub fn new(api: Twitch, cfg: Config, streamers: Vec<Streamer>) -> Self {
+        let index = streamers
             .iter()
-            .position(|s| s.lock().unwrap().channel_id == channel_id)
-    }
-
-    fn login_of(&self, i: usize) -> String {
-        self.streamers[i].lock().unwrap().login.clone()
-    }
-
-    pub fn set_offline(&self, i: usize) {
-        let announce = self.started.load(Ordering::Relaxed);
-        self.streamers[i].lock().unwrap().set_offline(announce);
-    }
-
-    fn is_online(&self, i: usize) -> bool {
-        self.streamers[i].lock().unwrap().online
-    }
-
-    /// Loads the balance and claims a pending bonus chest.
-    pub async fn load_points(&self, i: usize) -> Result<()> {
-        let login = self.login_of(i);
-        let r = self
-            .api
-            .gql(&api::POINTS_CONTEXT, json!({"channelLogin": login}))
-            .await?;
-        let cp = &r["data"]["community"]["channel"]["self"]["communityPoints"];
-        if let Some(balance) = cp["balance"].as_i64() {
-            self.streamers[i].lock().unwrap().points = balance;
+            .enumerate()
+            .map(|(i, s)| (s.channel_id.clone(), i))
+            .collect();
+        Self {
+            api,
+            cfg,
+            streamers,
+            index,
+            started: AtomicBool::new(false),
         }
-        if let Some(claim_id) = cp["availableClaim"]["id"].as_str() {
-            self.claim_bonus(i, claim_id).await;
-        }
-        Ok(())
     }
 
-    pub async fn claim_bonus(&self, i: usize, claim_id: &str) {
-        let (login, channel_id) = {
-            let s = self.streamers[i].lock().unwrap();
-            (s.login.clone(), s.channel_id.clone())
+    pub fn find(&self, channel_id: &str) -> Option<usize> {
+        self.index.get(channel_id).copied()
+    }
+
+    fn announce(&self) -> bool {
+        self.started.load(Ordering::Relaxed)
+    }
+
+    /// Loads balances and stream status for every streamer, prints the overview
+    /// and enables live status messages.
+    pub async fn start(&self) {
+        let all: Vec<usize> = (0..self.streamers.len()).collect();
+        self.refresh(&all, true).await;
+        for s in &self.streamers {
+            let mut st = s.state();
+            st.start_points = st.points;
+        }
+        self.print_status("Streamers:");
+        self.started.store(true, Ordering::Relaxed);
+    }
+
+    /// Batch-loads balances (claiming pending bonus chests) and optionally stream status.
+    async fn refresh(&self, ids: &[usize], with_stream: bool) {
+        let mut reqs = Vec::new();
+        for &i in ids {
+            let login = &self.streamers[i].login;
+            reqs.push((&api::POINTS_CONTEXT, json!({"channelLogin": login})));
+            if with_stream {
+                reqs.push((&api::STREAM_INFO, json!({"channel": login})));
+            }
+        }
+        let results = match self.api.gql_batch(reqs).await {
+            Ok(r) => r,
+            Err(e) => {
+                log!("Loading streamers failed: {e:#}");
+                return;
+            }
         };
-        log!("Claiming bonus chest on {login}");
-        let vars = json!({"input": {"channelID": channel_id, "claimID": claim_id}});
+        let per_streamer = if with_stream { 2 } else { 1 };
+
+        let mut claims = Vec::new();
+        for (&i, r) in ids.iter().zip(results.chunks(per_streamer)) {
+            let cp = &r[0]["data"]["community"]["channel"]["self"]["communityPoints"];
+            match cp["balance"].as_i64() {
+                Some(balance) => self.streamers[i].state().points = balance,
+                None => log!("Cannot load points for {}", self.streamers[i].login),
+            }
+            if let Some(claim) = cp["availableClaim"]["id"].as_str() {
+                claims.push(self.claim_bonus(i, claim.to_owned()));
+            }
+            if with_stream {
+                self.apply_stream_info(i, &r[1]);
+            }
+        }
+        join_all(claims).await;
+    }
+
+    pub async fn claim_bonus(&self, i: usize, claim_id: String) {
+        let s = &self.streamers[i];
+        log!("Claiming bonus chest on {}", s.login);
+        let vars = json!({"input": {"channelID": s.channel_id, "claimID": claim_id}});
         if let Err(e) = self.api.gql(&api::CLAIM_POINTS, vars).await {
-            log!("Bonus chest on {login} failed: {e:#}");
+            log!("Bonus chest on {} failed: {e:#}", s.login);
         }
     }
 
-    pub async fn claim_moment(&self, i: usize, moment_id: &str) {
-        let login = self.login_of(i);
+    pub async fn claim_moment(&self, i: usize, moment_id: String) {
+        let login = &self.streamers[i].login;
         log!("Claiming moment on {login}");
         let vars = json!({"input": {"momentID": moment_id}});
         if let Err(e) = self.api.gql(&api::CLAIM_MOMENT, vars).await {
@@ -168,23 +198,23 @@ impl Miner {
         }
     }
 
-    pub async fn join_raid(&self, i: usize, raid_id: &str, target: &str) {
-        let login = {
-            let mut s = self.streamers[i].lock().unwrap();
-            if s.last_raid.as_deref() == Some(raid_id) {
+    pub async fn join_raid(&self, i: usize, raid_id: String, target: String) {
+        let s = &self.streamers[i];
+        {
+            let mut st = s.state();
+            if st.last_raid.as_deref() == Some(raid_id.as_str()) {
                 return;
             }
-            s.last_raid = Some(raid_id.to_owned());
-            s.login.clone()
-        };
-        log!("Joining raid from {login} to {target}");
+            st.last_raid = Some(raid_id.clone());
+        }
+        log!("Joining raid from {} to {target}", s.login);
         let vars = json!({"input": {"raidID": raid_id}});
         if let Err(e) = self.api.gql(&api::JOIN_RAID, vars).await {
             log!("Joining raid failed: {e:#}");
         }
     }
 
-    pub async fn claim_drop(&self, instance_id: &str, name: &str) {
+    pub async fn claim_drop(&self, instance_id: String, name: String) {
         let vars = json!({"input": {"dropInstanceID": instance_id}});
         match self.api.gql(&api::CLAIM_DROP, vars).await {
             Ok(r) => match r["data"]["claimDropRewards"]["status"].as_str() {
@@ -201,7 +231,7 @@ impl Miner {
     }
 
     /// Claims every finished but unclaimed drop in the inventory.
-    pub async fn claim_inventory_drops(&self) -> Result<()> {
+    async fn claim_inventory_drops(&self) -> Result<()> {
         let r = self
             .api
             .gql(&api::INVENTORY, json!({"fetchRewardCampaigns": true}))
@@ -221,8 +251,11 @@ impl Miner {
                     .or(drop["name"].as_str())
                     .unwrap_or("unknown");
                 let campaign_name = campaign["name"].as_str().unwrap_or("unknown campaign");
-                self.claim_drop(instance_id, &format!("{reward} ({campaign_name})"))
-                    .await;
+                self.claim_drop(
+                    instance_id.to_owned(),
+                    format!("{reward} ({campaign_name})"),
+                )
+                .await;
                 tokio::time::sleep(Duration::from_secs(rand::random_range(5..10))).await;
             }
         }
@@ -239,88 +272,131 @@ impl Miner {
     }
 
     pub fn points_earned(&self, i: usize, balance: Option<i64>, earned: Option<(i64, &str)>) {
-        let mut s = self.streamers[i].lock().unwrap();
+        let s = &self.streamers[i];
+        let mut st = s.state();
         if let Some(b) = balance {
-            s.points = b;
+            st.points = b;
         }
         if let Some((amount, reason)) = earned {
-            let h = s.history.entry(reason.to_owned()).or_default();
+            let h = st.history.entry(reason.to_owned()).or_default();
             h.0 += 1;
             h.1 += amount;
             if reason == "WATCH_STREAK" {
-                s.watch_streak_missing = false;
+                st.watch_streak_missing = false;
             }
             log!(
                 "POINTS   +{amount} on {} from {} - now {} points",
                 s.login,
                 reason_text(reason),
-                fmt_points(s.points)
+                fmt_points(st.points)
             );
+        }
+    }
+
+    pub fn set_stream_up(&self, i: usize) {
+        self.streamers[i].state().stream_up_at = Some(Instant::now());
+    }
+
+    /// stream-up arrives before the API knows the stream; give it two minutes.
+    pub fn stream_ready(&self, i: usize) -> bool {
+        self.streamers[i]
+            .state()
+            .stream_up_at
+            .is_none_or(|t| t.elapsed() > Duration::from_secs(120))
+    }
+
+    pub fn set_offline(&self, i: usize) {
+        let s = &self.streamers[i];
+        let mut st = s.state();
+        if st.online {
+            st.online = false;
+            st.offline_at = Some(Instant::now());
+            if self.announce() {
+                log!(
+                    "OFFLINE  {} went offline - {} points",
+                    s.login,
+                    fmt_points(st.points)
+                );
+            }
+        }
+    }
+
+    /// Applies a STREAM_INFO response: updates broadcast/game and the online state.
+    fn apply_stream_info(&self, i: usize, r: &Value) {
+        let user = &r["data"]["user"];
+        if user.is_null() {
+            return; // request failed, keep the current state
+        }
+        let Some(broadcast_id) = user["stream"]["id"].as_str() else {
+            self.set_offline(i);
+            return;
+        };
+        let s = &self.streamers[i];
+        let game = &user["broadcastSettings"]["game"];
+        let mut st = s.state();
+        st.broadcast_id = Some(broadcast_id.to_owned());
+        st.game = match (game["id"].as_str(), game["name"].as_str()) {
+            (Some(id), Some(name)) => Some((id.to_owned(), name.to_owned())),
+            _ => None,
+        };
+        st.last_update = Some(Instant::now());
+        if !st.online {
+            st.online = true;
+            st.online_at = Some(Instant::now());
+            st.watch_streak_missing = true;
+            st.minutes_watched = 0.0;
+            st.last_watch = None;
+            if self.announce() {
+                log!(
+                    "ONLINE   {} is now live ({}) - {} points",
+                    s.login,
+                    st.game_name(),
+                    fmt_points(st.points)
+                );
+            }
         }
     }
 
     /// Re-checks online state via GQL. Online streamers are refreshed at most every 2 minutes.
     pub async fn check_online(&self, i: usize) {
-        let (login, online) = {
-            let s = self.streamers[i].lock().unwrap();
+        let s = &self.streamers[i];
+        {
+            let st = s.state();
             // Avoid flapping right after going offline
-            if elapsed(s.offline_at).is_some_and(|d| d < Duration::from_secs(60)) {
+            if elapsed(st.offline_at).is_some_and(|d| d < Duration::from_secs(60)) {
                 return;
             }
-            if s.online && elapsed(s.last_update).is_some_and(|d| d < Duration::from_secs(120)) {
+            if st.online && elapsed(st.last_update).is_some_and(|d| d < Duration::from_secs(120)) {
                 return;
             }
-            (s.login.clone(), s.online)
-        };
-
-        let r = match self
+        }
+        match self
             .api
-            .gql(&api::STREAM_INFO, json!({"channel": login}))
+            .gql(&api::STREAM_INFO, json!({"channel": s.login}))
             .await
         {
-            Ok(r) => r,
-            Err(e) => {
-                log!("Stream info for {login} failed: {e:#}");
-                return;
-            }
-        };
-        let user = &r["data"]["user"];
-        let Some(broadcast_id) = user["stream"]["id"].as_str() else {
-            self.set_offline(i);
-            return;
-        };
-        if !online && let Err(e) = self.api.spade_url(&login).await {
-            log!("Cannot get spade_url: {e:#}");
-            return;
+            Ok(r) => self.apply_stream_info(i, &r),
+            Err(e) => log!("Stream info for {} failed: {e:#}", s.login),
         }
-        let game = &user["broadcastSettings"]["game"];
-        let mut s = self.streamers[i].lock().unwrap();
-        s.broadcast_id = Some(broadcast_id.to_owned());
-        s.game = match (game["id"].as_str(), game["name"].as_str()) {
-            (Some(id), Some(name)) => Some((id.to_owned(), name.to_owned())),
-            _ => None,
-        };
-        s.last_update = Some(Instant::now());
-        s.set_online(self.started.load(Ordering::Relaxed));
     }
 
     /// Picks which streamers get watched this round: missing watch streaks first, then config order.
     fn pick(&self) -> Vec<usize> {
         let candidates: Vec<usize> = (0..self.streamers.len())
             .filter(|&i| {
-                let s = self.streamers[i].lock().unwrap();
-                s.online && elapsed(s.online_at).is_some_and(|d| d > Duration::from_secs(30))
+                let st = self.streamers[i].state();
+                st.online && elapsed(st.online_at).is_some_and(|d| d > Duration::from_secs(30))
             })
             .collect();
 
         let mut chosen = Vec::new();
         if self.cfg.watch_streak {
             for &i in &candidates {
-                let s = self.streamers[i].lock().unwrap();
+                let st = self.streamers[i].state();
                 // A streak needs ~6 minutes watched and 30 minutes since the previous stream ended
-                if s.watch_streak_missing
-                    && s.minutes_watched < 7.0
-                    && elapsed(s.offline_at).is_none_or(|d| d > Duration::from_secs(30 * 60))
+                if st.watch_streak_missing
+                    && st.minutes_watched < 7.0
+                    && elapsed(st.offline_at).is_none_or(|d| d > Duration::from_secs(30 * 60))
                     && chosen.len() < MAX_WATCHING
                 {
                     chosen.push(i);
@@ -339,8 +415,9 @@ impl Miner {
     }
 
     async fn watch(&self, i: usize) -> Result<()> {
-        let (login, payload) = {
-            let s = self.streamers[i].lock().unwrap();
+        let s = &self.streamers[i];
+        let payload = {
+            let st = s.state();
             let user_id = self
                 .api
                 .user_id
@@ -349,32 +426,32 @@ impl Miner {
                 .unwrap_or_else(|_| Value::from(self.api.user_id.clone()));
             let mut props = json!({
                 "channel_id": s.channel_id,
-                "broadcast_id": s.broadcast_id,
+                "broadcast_id": st.broadcast_id,
                 "player": "site",
                 "user_id": user_id,
                 "live": true,
                 "channel": s.login,
             });
             if self.cfg.claim_drops
-                && let Some((game_id, game)) = &s.game
+                && let Some((game_id, game)) = &st.game
             {
                 props["game"] = game.clone().into();
                 props["game_id"] = game_id.clone().into();
             }
-            (
-                s.login.clone(),
-                json!([{"event": "minute-watched", "properties": props}]),
-            )
+            json!([{"event": "minute-watched", "properties": props}])
         };
 
-        self.api.touch_stream(&login).await?;
-        let spade = self.api.spade_url(&login).await?;
-        if self.api.send_minute_watched(&spade, &payload).await? {
-            let mut s = self.streamers[i].lock().unwrap();
-            if let Some(d) = elapsed(s.last_watch) {
-                s.minutes_watched += d.as_secs_f64() / 60.0;
+        let (touched, spade) = tokio::join!(
+            self.api.touch_stream(&s.login),
+            self.api.spade_url(&s.login)
+        );
+        touched?;
+        if self.api.send_minute_watched(&spade?, &payload).await? {
+            let mut st = s.state();
+            if let Some(d) = elapsed(st.last_watch) {
+                st.minutes_watched += d.as_secs_f64() / 60.0;
             }
-            s.last_watch = Some(Instant::now());
+            st.last_watch = Some(Instant::now());
         } else {
             // Maybe the endpoint moved; fetch it again next time
             self.api.reset_spade_url();
@@ -384,15 +461,14 @@ impl Miner {
 
     pub async fn watch_loop(self: Arc<Self>) {
         loop {
-            for i in 0..self.streamers.len() {
-                let stale = {
-                    let s = self.streamers[i].lock().unwrap();
-                    s.online && elapsed(s.last_update).is_some_and(|d| d > Duration::from_secs(600))
-                };
-                if stale {
-                    self.check_online(i).await;
-                }
-            }
+            let stale: Vec<usize> = (0..self.streamers.len())
+                .filter(|&i| {
+                    let st = self.streamers[i].state();
+                    st.online
+                        && elapsed(st.last_update).is_some_and(|d| d > Duration::from_secs(600))
+                })
+                .collect();
+            join_all(stale.into_iter().map(|i| self.check_online(i))).await;
 
             let chosen = self.pick();
             if chosen.is_empty() {
@@ -403,25 +479,25 @@ impl Miner {
             for i in chosen {
                 let next = Instant::now() + slot;
                 if let Err(e) = self.watch(i).await {
-                    log!("Watching {} failed: {e:#}", self.login_of(i));
+                    log!("Watching {} failed: {e:#}", self.streamers[i].login);
                 }
                 tokio::time::sleep_until(next.into()).await;
             }
         }
     }
 
-    /// Periodically re-syncs balances, as a fallback for missed PubSub events.
+    /// Periodic background work: balances as fallback for missed PubSub events,
+    /// and the Client-Version header.
     pub async fn refresh_loop(self: Arc<Self>) {
         loop {
             tokio::time::sleep(Duration::from_secs(30 * 60)).await;
-            for i in 0..self.streamers.len() {
-                if !self.is_online(i) {
-                    continue;
-                }
-                if let Err(e) = self.load_points(i).await {
-                    log!("Loading points for {} failed: {e:#}", self.login_of(i));
-                }
-            }
+            let online: Vec<usize> = (0..self.streamers.len())
+                .filter(|&i| self.streamers[i].state().online)
+                .collect();
+            tokio::join!(
+                self.refresh(&online, false),
+                self.api.refresh_client_version()
+            );
         }
     }
 
@@ -431,21 +507,20 @@ impl Miner {
         let width = self
             .streamers
             .iter()
-            .map(|s| s.lock().unwrap().login.len())
+            .map(|s| s.login.len())
             .max()
             .unwrap_or(0);
         for s in &self.streamers {
-            let s = s.lock().unwrap();
-            let state = if s.online { "online " } else { "offline" };
-            let game = if s.online {
-                format!("  ({})", s.game_name())
+            let st = s.state();
+            let (state, game) = if st.online {
+                ("online ", format!("  ({})", st.game_name()))
             } else {
-                String::new()
+                ("offline", String::new())
             };
             println!(
                 "    {state}  {:<width$}  {:>12} points{game}",
                 s.login,
-                fmt_points(s.points)
+                fmt_points(st.points)
             );
         }
     }
@@ -455,13 +530,13 @@ impl Miner {
         log!("Earned this session:");
         let mut total = 0;
         for s in &self.streamers {
-            let s = s.lock().unwrap();
-            let gained = s.points - s.start_points;
+            let st = s.state();
+            let gained = st.points - st.start_points;
             total += gained;
-            if s.history.is_empty() && gained == 0 {
+            if st.history.is_empty() && gained == 0 {
                 continue;
             }
-            let details: Vec<String> = s
+            let details: Vec<String> = st
                 .history
                 .iter()
                 .map(|(reason, (n, pts))| {
@@ -469,18 +544,13 @@ impl Miner {
                 })
                 .collect();
             println!(
-                "    {}: {}{} ({})",
+                "    {}: {} ({})",
                 s.login,
-                if gained >= 0 { "+" } else { "" },
-                fmt_points(gained),
+                fmt_signed(gained),
                 details.join(", ")
             );
         }
-        println!(
-            "    Total: {}{}",
-            if total >= 0 { "+" } else { "" },
-            fmt_points(total)
-        );
+        println!("    Total: {}", fmt_signed(total));
     }
 }
 
@@ -495,6 +565,8 @@ mod tests {
         assert_eq!(fmt_points(1000), "1,000");
         assert_eq!(fmt_points(1234567), "1,234,567");
         assert_eq!(fmt_points(-45000), "-45,000");
+        assert_eq!(fmt_signed(1500), "+1,500");
+        assert_eq!(fmt_signed(-20), "-20");
     }
 
     #[test]

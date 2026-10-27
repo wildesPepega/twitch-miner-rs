@@ -5,8 +5,7 @@ mod pubsub;
 
 use anyhow::Result;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 
 use miner::{Miner, Streamer};
 
@@ -44,43 +43,23 @@ async fn run() -> Result<()> {
     logins.retain(|l| !cfg.blacklist.contains(l) && seen.insert(l.clone()));
 
     log!("Loading {} streamers...", logins.len());
+    let ids = api.channel_ids(&logins).await?;
     let mut streamers = Vec::new();
-    for login in logins {
-        tokio::time::sleep(Duration::from_millis(rand::random_range(300..700))).await;
-        match api.channel_id(&login).await {
-            Ok(Some(channel_id)) => streamers.push(Mutex::new(Streamer {
-                login,
-                channel_id,
-                ..Default::default()
-            })),
-            Ok(None) => log!("Streamer {login} does not exist"),
-            Err(e) => log!("Cannot load streamer {login}: {e:#}"),
+    for (login, id) in logins.into_iter().zip(ids) {
+        match id {
+            Some(channel_id) => streamers.push(Streamer::new(login, channel_id)),
+            None => log!("Streamer {login} does not exist"),
         }
     }
     if streamers.is_empty() {
         anyhow::bail!("No valid streamers");
     }
 
-    let miner = Arc::new(Miner {
-        api,
-        cfg,
-        streamers,
-        started: Default::default(),
-    });
-    for i in 0..miner.streamers.len() {
-        tokio::time::sleep(Duration::from_millis(rand::random_range(300..700))).await;
-        if let Err(e) = miner.load_points(i).await {
-            log!("Cannot load points: {e:#}");
-        }
-        miner.check_online(i).await;
-        let mut s = miner.streamers[i].lock().unwrap();
-        s.start_points = s.points;
-    }
-
-    miner.print_status("Streamers:");
-    miner
-        .started
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let miner = Arc::new(Miner::new(api, cfg, streamers));
+    // Warm up the spade URL in the background; only watching needs it
+    let m = miner.clone();
+    tokio::spawn(async move { m.api.spade_url(&m.streamers[0].login).await });
+    miner.start().await;
 
     pubsub::spawn_all(&miner);
     tokio::spawn(miner.clone().watch_loop());
