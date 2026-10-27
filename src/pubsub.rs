@@ -168,7 +168,7 @@ fn handle(miner: &Arc<Miner>, topic: &str, msg: Value) {
             miner.streamers[i].lock().unwrap().stream_up_at = Some(Instant::now());
         }
         ("video-playback-by-id", "stream-down") => {
-            miner.streamers[i].lock().unwrap().set_offline();
+            miner.set_offline(i);
         }
         ("video-playback-by-id", "viewcount") => {
             // stream-up arrives before the API knows the stream; give it two minutes

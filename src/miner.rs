@@ -3,6 +3,7 @@
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,23 +36,64 @@ pub struct Streamer {
     pub history: BTreeMap<String, (u32, i64)>,
 }
 
+/// 1234567 -> "1,234,567"
+pub fn fmt_points(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if n < 0 { format!("-{out}") } else { out }
+}
+
+/// Human readable source of a point gain.
+fn reason_text(code: &str) -> String {
+    match code {
+        "WATCH" => "watching".into(),
+        "CLAIM" => "bonus chest".into(),
+        "WATCH_STREAK" => "watch streak".into(),
+        "RAID" => "raid".into(),
+        other => other.to_lowercase().replace('_', " "),
+    }
+}
+
 impl Streamer {
-    fn set_online(&mut self) {
+    fn game_name(&self) -> &str {
+        self.game.as_ref().map_or("unknown game", |g| g.1.as_str())
+    }
+
+    fn set_online(&mut self, announce: bool) {
         if !self.online {
             self.online = true;
             self.online_at = Some(Instant::now());
             self.watch_streak_missing = true;
             self.minutes_watched = 0.0;
             self.last_watch = None;
-            log!("{} is online ({} points)", self.login, self.points);
+            if announce {
+                log!(
+                    "ONLINE   {} is now live ({}) - {} points",
+                    self.login,
+                    self.game_name(),
+                    fmt_points(self.points)
+                );
+            }
         }
     }
 
-    pub fn set_offline(&mut self) {
+    fn set_offline(&mut self, announce: bool) {
         if self.online {
             self.online = false;
             self.offline_at = Some(Instant::now());
-            log!("{} is offline", self.login);
+            if announce {
+                log!(
+                    "OFFLINE  {} went offline - {} points",
+                    self.login,
+                    fmt_points(self.points)
+                );
+            }
         }
     }
 }
@@ -60,6 +102,8 @@ pub struct Miner {
     pub api: Twitch,
     pub cfg: Config,
     pub streamers: Vec<Mutex<Streamer>>,
+    /// Status changes are only announced after the startup overview
+    pub started: AtomicBool,
 }
 
 fn elapsed(t: Option<Instant>) -> Option<Duration> {
@@ -75,6 +119,11 @@ impl Miner {
 
     fn login_of(&self, i: usize) -> String {
         self.streamers[i].lock().unwrap().login.clone()
+    }
+
+    pub fn set_offline(&self, i: usize) {
+        let announce = self.started.load(Ordering::Relaxed);
+        self.streamers[i].lock().unwrap().set_offline(announce);
     }
 
     fn is_online(&self, i: usize) -> bool {
@@ -201,7 +250,12 @@ impl Miner {
             if reason == "WATCH_STREAK" {
                 s.watch_streak_missing = false;
             }
-            log!("+{amount} on {} ({reason}) -> {} points", s.login, s.points);
+            log!(
+                "POINTS   +{amount} on {} from {} - now {} points",
+                s.login,
+                reason_text(reason),
+                fmt_points(s.points)
+            );
         }
     }
 
@@ -232,7 +286,7 @@ impl Miner {
         };
         let user = &r["data"]["user"];
         let Some(broadcast_id) = user["stream"]["id"].as_str() else {
-            self.streamers[i].lock().unwrap().set_offline();
+            self.set_offline(i);
             return;
         };
         if !online && let Err(e) = self.api.spade_url(&login).await {
@@ -247,7 +301,7 @@ impl Miner {
             _ => None,
         };
         s.last_update = Some(Instant::now());
-        s.set_online();
+        s.set_online(self.started.load(Ordering::Relaxed));
     }
 
     /// Picks which streamers get watched this round: missing watch streaks first, then config order.
@@ -371,24 +425,82 @@ impl Miner {
         }
     }
 
-    pub fn print_summary(&self) {
-        log!("Summary:");
+    /// Prints every streamer with its online state and balance.
+    pub fn print_status(&self, title: &str) {
+        log!("{title}");
+        let width = self
+            .streamers
+            .iter()
+            .map(|s| s.lock().unwrap().login.len())
+            .max()
+            .unwrap_or(0);
         for s in &self.streamers {
             let s = s.lock().unwrap();
-            if s.history.is_empty() {
+            let state = if s.online { "online " } else { "offline" };
+            let game = if s.online {
+                format!("  ({})", s.game_name())
+            } else {
+                String::new()
+            };
+            println!(
+                "    {state}  {:<width$}  {:>12} points{game}",
+                s.login,
+                fmt_points(s.points)
+            );
+        }
+    }
+
+    pub fn print_summary(&self) {
+        self.print_status("Current status:");
+        log!("Earned this session:");
+        let mut total = 0;
+        for s in &self.streamers {
+            let s = s.lock().unwrap();
+            let gained = s.points - s.start_points;
+            total += gained;
+            if s.history.is_empty() && gained == 0 {
                 continue;
             }
             let details: Vec<String> = s
                 .history
                 .iter()
-                .map(|(reason, (n, pts))| format!("{reason} {n}x +{pts}"))
+                .map(|(reason, (n, pts))| {
+                    format!("{} {n}x +{}", reason_text(reason), fmt_points(*pts))
+                })
                 .collect();
             println!(
-                "  {}: {:+} points ({})",
+                "    {}: {}{} ({})",
                 s.login,
-                s.points - s.start_points,
+                if gained >= 0 { "+" } else { "" },
+                fmt_points(gained),
                 details.join(", ")
             );
         }
+        println!(
+            "    Total: {}{}",
+            if total >= 0 { "+" } else { "" },
+            fmt_points(total)
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_points() {
+        assert_eq!(fmt_points(0), "0");
+        assert_eq!(fmt_points(999), "999");
+        assert_eq!(fmt_points(1000), "1,000");
+        assert_eq!(fmt_points(1234567), "1,234,567");
+        assert_eq!(fmt_points(-45000), "-45,000");
+    }
+
+    #[test]
+    fn readable_reasons() {
+        assert_eq!(reason_text("CLAIM"), "bonus chest");
+        assert_eq!(reason_text("WATCH_STREAK"), "watch streak");
+        assert_eq!(reason_text("SOME_NEW_CODE"), "some new code");
     }
 }

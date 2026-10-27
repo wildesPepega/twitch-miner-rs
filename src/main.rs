@@ -65,6 +65,7 @@ async fn run() -> Result<()> {
         api,
         cfg,
         streamers,
+        started: Default::default(),
     });
     for i in 0..miner.streamers.len() {
         tokio::time::sleep(Duration::from_millis(rand::random_range(300..700))).await;
@@ -75,6 +76,11 @@ async fn run() -> Result<()> {
         let mut s = miner.streamers[i].lock().unwrap();
         s.start_points = s.points;
     }
+
+    miner.print_status("Streamers:");
+    miner
+        .started
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 
     pubsub::spawn_all(&miner);
     tokio::spawn(miner.clone().watch_loop());
