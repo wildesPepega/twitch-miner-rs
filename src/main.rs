@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod miner;
+mod notify;
 mod pubsub;
 
 use anyhow::Result;
@@ -18,8 +19,13 @@ macro_rules! log {
 
 #[tokio::main]
 async fn main() {
-    if let Err(e) = run().await {
+    let result = run().await;
+    if let Err(e) = &result {
         log!("Error: {e:#}");
+        notify::send(notify::Event::Error, format!("❌ Miner stopped: {e:#}"));
+    }
+    notify::flush().await;
+    if result.is_err() {
         std::process::exit(1);
     }
 }
@@ -31,11 +37,12 @@ async fn run() -> Result<()> {
             .unwrap_or_else(|| "config.toml".into()),
     );
     let cfg = config::Config::load(&path)?;
+    notify::init(cfg.discord_webhook.clone(), &cfg.discord_events);
     let api = api::Twitch::login(&cfg.username).await?;
 
     let mut logins = cfg.streamers.clone();
     if cfg.followers {
-        let follows = api.followers().await?;
+        let follows = api::retry("Loading followed channels", || api.followers()).await;
         log!("Loaded {} followed channels", follows.len());
         logins.extend(follows);
     }
@@ -43,7 +50,7 @@ async fn run() -> Result<()> {
     logins.retain(|l| !cfg.blacklist.contains(l) && seen.insert(l.clone()));
 
     log!("Loading {} streamers...", logins.len());
-    let ids = api.channel_ids(&logins).await?;
+    let ids = api::retry("Loading channel ids", || api.channel_ids(&logins)).await;
     let mut streamers = Vec::new();
     for (login, id) in logins.into_iter().zip(ids) {
         match id {

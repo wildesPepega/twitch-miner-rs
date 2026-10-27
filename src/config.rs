@@ -2,6 +2,8 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::path::Path;
 
+use crate::notify::Event;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -21,6 +23,10 @@ pub struct Config {
     pub watch_streak: bool,
     #[serde(default = "yes")]
     pub claim_drops: bool,
+    #[serde(default)]
+    pub discord_webhook: Option<String>,
+    #[serde(default = "Event::defaults")]
+    pub discord_events: Vec<Event>,
 }
 
 fn yes() -> bool {
@@ -74,6 +80,27 @@ impl Config {
         env_bool("CLAIM_MOMENTS", &mut cfg.claim_moments)?;
         env_bool("WATCH_STREAK", &mut cfg.watch_streak)?;
         env_bool("CLAIM_DROPS", &mut cfg.claim_drops)?;
+        if let Some(url) = env("DISCORD_WEBHOOK") {
+            cfg.discord_webhook = Some(url);
+        }
+        if let Some(v) = env("DISCORD_EVENTS") {
+            cfg.discord_events = v
+                .split([',', ' '])
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    Event::parse(s).with_context(|| format!("Unknown DISCORD_EVENTS entry '{s}'"))
+                })
+                .collect::<Result<_>>()?;
+        }
+        cfg.discord_webhook = cfg
+            .discord_webhook
+            .map(|u| u.trim().to_owned())
+            .filter(|u| !u.is_empty());
+        if let Some(u) = &cfg.discord_webhook
+            && !u.starts_with("https://")
+        {
+            bail!("discord_webhook must be an https:// URL");
+        }
 
         cfg.username = cfg.username.trim().to_lowercase();
         if cfg.username.is_empty() || cfg.username == "your-twitch-username" {

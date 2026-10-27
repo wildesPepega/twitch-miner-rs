@@ -60,7 +60,7 @@ async fn session(miner: &Arc<Miner>, topics: &[String]) -> Result<()> {
         let mut data = json!({"topics": [topic]});
         // Topics about our own account need the auth token
         if topic.ends_with(&format!(".{}", miner.api.user_id)) {
-            data["auth_token"] = miner.api.token.clone().into();
+            data["auth_token"] = miner.api.token().into();
         }
         let msg = json!({"type": "LISTEN", "nonce": random_string(30, ALNUM), "data": data});
         ws.send(Message::text(msg.to_string())).await?;
@@ -87,7 +87,8 @@ async fn session(miner: &Arc<Miner>, topics: &[String]) -> Result<()> {
                     Some("RESPONSE") => {
                         let err = v["error"].as_str().unwrap_or_default();
                         if err == "ERR_BADAUTH" {
-                            log!("PubSub: token rejected. Delete {}.token.json and restart", miner.cfg.username);
+                            miner.api.reauth().await;
+                            bail!("token was rejected");
                         } else if !err.is_empty() {
                             log!("PubSub LISTEN error: {err}");
                         }

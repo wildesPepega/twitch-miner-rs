@@ -7,7 +7,7 @@
     "exported_at": "2026-10-27T00:00:00+00:00",
     "name": "Twitch Miner",
     "author": "wildesPepega@users.noreply.github.com",
-    "description": "Lightweight Twitch channel points miner: watches streams, claims bonus chests, drops and moments, joins raids. On first start, open https://www.twitch.tv/activate and enter the code shown in the console.",
+    "description": "Lightweight Twitch channel points miner: watches streams, claims bonus chests, drops and moments, joins raids, optional Discord notifications. On first start, open https://www.twitch.tv/activate and enter the code shown in the console.",
     "features": null,
     "docker_images": {
         "Debian": "ghcr.io/parkervcp/yolks:debian"
@@ -106,6 +106,26 @@
             "user_viewable": true,
             "user_editable": true,
             "rules": "required|string|in:true,false",
+            "field_type": "text"
+        },
+        {
+            "name": "Discord Webhook",
+            "description": "Optional Discord webhook URL for notifications.",
+            "env_variable": "DISCORD_WEBHOOK",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|starts_with:https://|max:300",
+            "field_type": "text"
+        },
+        {
+            "name": "Discord Events",
+            "description": "Events sent to Discord, comma separated: online, offline, points, bonus, raid, moment, drop, login, error.",
+            "env_variable": "DISCORD_EVENTS",
+            "default_value": "online,offline,drop,raid,login,error",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:200",
             "field_type": "text"
         },
         {

@@ -10,6 +10,7 @@ use std::sync::{LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::log;
+use crate::notify::{self, Event};
 
 pub const CLIENT_ID: &str = "ue6666qo983tsx6so1t0vnawi233wa"; // Android TV
 const DEFAULT_CLIENT_VERSION: &str = "ef928475-9403-42f2-8a34-55784bd08e16";
@@ -80,8 +81,12 @@ struct TokenFile {
 
 pub struct Twitch {
     pub http: reqwest::Client,
-    pub token: String,
+    token: RwLock<String>,
     pub user_id: String,
+    username: String,
+    token_path: PathBuf,
+    /// Only one re-login at a time
+    reauth_lock: tokio::sync::Mutex<()>,
     device_id: String,
     session_id: String,
     client_version: RwLock<String>,
@@ -96,6 +101,24 @@ pub fn random_string(len: usize, charset: &[u8]) -> String {
         .collect()
 }
 
+/// Retries a fallible network step with growing delays (5s up to 5min).
+pub async fn retry<T, Fut>(what: &str, mut f: impl FnMut() -> Fut) -> T
+where
+    Fut: Future<Output = Result<T>>,
+{
+    let mut delay = Duration::from_secs(5);
+    loop {
+        match f().await {
+            Ok(v) => return v,
+            Err(e) => {
+                log!("{what} failed: {e:#}, retrying in {}s", delay.as_secs());
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(300));
+            }
+        }
+    }
+}
+
 pub const ALNUM: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const HEX: &[u8] = b"0123456789abcdef";
 
@@ -108,43 +131,19 @@ impl Twitch {
         let device_id = random_string(32, ALNUM);
         let token_path = PathBuf::from(format!("{username}.token.json"));
 
-        let saved = std::fs::read_to_string(&token_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<TokenFile>(&s).ok())
-            .map(|t| t.auth_token);
-
-        let auth = async {
-            let mut token = saved;
-            loop {
-                let t = match token.take() {
-                    Some(t) => t,
-                    None => {
-                        let t = device_login(&http, &device_id).await?;
-                        save_token(&token_path, &t)?;
-                        t
-                    }
-                };
-                match validate(&http, &t).await? {
-                    Some((login, id)) => {
-                        if login != username {
-                            log!("Warning: token belongs to '{login}', not '{username}'");
-                        }
-                        return Ok::<_, anyhow::Error>((t, id));
-                    }
-                    None => {
-                        log!("Saved token is invalid, logging in again");
-                        let _ = std::fs::remove_file(&token_path);
-                    }
-                }
-            }
-        };
+        let auth = retry("Login", || {
+            authenticate(&http, &device_id, username, &token_path)
+        });
         let (auth, client_version) = tokio::join!(auth, fetch_client_version(&http));
-        let (token, user_id) = auth?;
+        let (token, user_id) = auth;
 
         Ok(Self {
             http,
-            token,
+            token: RwLock::new(token),
             user_id,
+            username: username.to_owned(),
+            token_path,
+            reauth_lock: tokio::sync::Mutex::new(()),
             device_id,
             session_id: random_string(32, HEX),
             client_version: RwLock::new(
@@ -153,6 +152,43 @@ impl Twitch {
             spade_url: RwLock::new(None),
             playlists: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub fn token(&self) -> String {
+        self.token.read().unwrap().clone()
+    }
+
+    /// Called when Twitch rejects the token: logs in again if it is really invalid.
+    pub async fn reauth(&self) {
+        let _guard = self.reauth_lock.lock().await;
+        // Another task may have refreshed it already, or the rejection was a hiccup
+        match validate(&self.http, &self.token()).await {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(e) => {
+                log!("Cannot validate token: {e:#}");
+                return;
+            }
+        }
+        log!("Twitch rejected the token, logging in again");
+        notify::send(
+            Event::Error,
+            "Twitch rejected the token, a new login is required",
+        );
+        let _ = std::fs::remove_file(&self.token_path);
+        let (token, user_id) = retry("Login", || {
+            authenticate(
+                &self.http,
+                &self.device_id,
+                &self.username,
+                &self.token_path,
+            )
+        })
+        .await;
+        if user_id != self.user_id {
+            log!("Warning: new login is a different account, restart the miner");
+        }
+        *self.token.write().unwrap() = token;
     }
 
     /// Twitch wants a recent web build id as Client-Version; call this periodically.
@@ -164,10 +200,10 @@ impl Twitch {
 
     async fn post_gql(&self, body: &Value) -> Result<Value> {
         let client_version = self.client_version.read().unwrap().clone();
-        Ok(self
+        let resp = self
             .http
             .post(GQL_URL)
-            .header("Authorization", format!("OAuth {}", self.token))
+            .header("Authorization", format!("OAuth {}", self.token()))
             .header("Client-Id", CLIENT_ID)
             .header("Client-Session-Id", &self.session_id)
             .header("Client-Version", client_version)
@@ -175,9 +211,12 @@ impl Twitch {
             .header("X-Device-Id", &self.device_id)
             .json(body)
             .send()
-            .await?
-            .json()
-            .await?)
+            .await?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.reauth().await;
+            bail!("token was rejected");
+        }
+        Ok(resp.json().await?)
     }
 
     pub async fn gql(&self, op: &Op, variables: Value) -> Result<Value> {
@@ -409,6 +448,43 @@ fn last_url(playlist: &str) -> Option<&str> {
         .rfind(|l| l.starts_with("http"))
 }
 
+/// Uses the saved token if Twitch accepts it, otherwise runs the device-code login.
+/// Returns (token, user_id).
+async fn authenticate(
+    http: &reqwest::Client,
+    device_id: &str,
+    username: &str,
+    token_path: &Path,
+) -> Result<(String, String)> {
+    let saved = std::fs::read_to_string(token_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<TokenFile>(&s).ok())
+        .map(|t| t.auth_token);
+    let mut token = saved;
+    loop {
+        let t = match token.take() {
+            Some(t) => t,
+            None => {
+                let t = device_login(http, device_id).await?;
+                save_token(token_path, &t)?;
+                t
+            }
+        };
+        match validate(http, &t).await? {
+            Some((login, id)) => {
+                if login != username {
+                    log!("Warning: token belongs to '{login}', not '{username}'");
+                }
+                return Ok((t, id));
+            }
+            None => {
+                log!("Saved token is invalid, logging in again");
+                let _ = std::fs::remove_file(token_path);
+            }
+        }
+    }
+}
+
 fn save_token(path: &Path, token: &str) -> Result<()> {
     let data = serde_json::to_string(&TokenFile {
         auth_token: token.to_owned(),
@@ -482,6 +558,12 @@ async fn device_login(http: &reqwest::Client, device_id: &str) -> Result<String>
             Instant::now() + Duration::from_secs(r["expires_in"].as_u64().unwrap_or(1800));
 
         log!("Open https://www.twitch.tv/activate and enter this code: {user_code}");
+        notify::send(
+            Event::Login,
+            format!(
+                "Twitch login required: open https://www.twitch.tv/activate and enter **{user_code}**"
+            ),
+        );
 
         while Instant::now() < expires {
             tokio::time::sleep(interval).await;
@@ -501,6 +583,7 @@ async fn device_login(http: &reqwest::Client, device_id: &str) -> Result<String>
                 && let Some(t) = r["access_token"].as_str()
             {
                 log!("Login successful");
+                notify::send(Event::Login, "Twitch login successful");
                 return Ok(t.to_owned());
             }
         }

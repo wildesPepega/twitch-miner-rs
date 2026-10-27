@@ -1,0 +1,14 @@
+services:
+  twitch-miner:
+    image: ghcr.io/wildespepega/twitch-miner-rs:latest
+    # or build it yourself: build: .
+    container_name: twitch-miner
+    restart: unless-stopped
+    volumes:
+      - ./data:/data   # token file (and optional config.toml) are stored here
+    environment:
+      TWITCH_USERNAME: your-twitch-username
+      STREAMERS: streamer1,streamer2
+      # FOLLOWERS: "false"
+      # DISCORD_WEBHOOK: https://discord.com/api/webhooks/...
+      # DISCORD_EVENTS: online,offline,drop,raid,login,error

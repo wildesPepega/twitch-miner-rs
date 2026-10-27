@@ -11,9 +11,13 @@ use std::time::{Duration, Instant};
 use crate::api::{self, Twitch};
 use crate::config::Config;
 use crate::log;
+use crate::notify::{self, Event};
 
 /// Twitch only credits watch time for two channels at the same time.
 const MAX_WATCHING: usize = 2;
+/// Polling interval for balances, bonus chests and stream status. Keeps the miner
+/// working even if PubSub events stop arriving.
+const POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 pub struct Streamer {
     pub login: String,
@@ -183,6 +187,10 @@ impl Miner {
     pub async fn claim_bonus(&self, i: usize, claim_id: String) {
         let s = &self.streamers[i];
         log!("Claiming bonus chest on {}", s.login);
+        notify::send(
+            Event::Bonus,
+            format!("🎁 Claimed bonus chest on **{}**", s.login),
+        );
         let vars = json!({"input": {"channelID": s.channel_id, "claimID": claim_id}});
         if let Err(e) = self.api.gql(&api::CLAIM_POINTS, vars).await {
             log!("Bonus chest on {} failed: {e:#}", s.login);
@@ -192,6 +200,7 @@ impl Miner {
     pub async fn claim_moment(&self, i: usize, moment_id: String) {
         let login = &self.streamers[i].login;
         log!("Claiming moment on {login}");
+        notify::send(Event::Moment, format!("🎬 Claimed moment on **{login}**"));
         let vars = json!({"input": {"momentID": moment_id}});
         if let Err(e) = self.api.gql(&api::CLAIM_MOMENT, vars).await {
             log!("Moment on {login} failed: {e:#}");
@@ -208,6 +217,10 @@ impl Miner {
             st.last_raid = Some(raid_id.clone());
         }
         log!("Joining raid from {} to {target}", s.login);
+        notify::send(
+            Event::Raid,
+            format!("⚔️ Joined raid from **{}** to **{target}**", s.login),
+        );
         let vars = json!({"input": {"raidID": raid_id}});
         if let Err(e) = self.api.gql(&api::JOIN_RAID, vars).await {
             log!("Joining raid failed: {e:#}");
@@ -219,7 +232,8 @@ impl Miner {
         match self.api.gql(&api::CLAIM_DROP, vars).await {
             Ok(r) => match r["data"]["claimDropRewards"]["status"].as_str() {
                 Some("ELIGIBLE_FOR_ALL" | "DROP_INSTANCE_ALREADY_CLAIMED") => {
-                    log!("Claimed drop: {name}")
+                    log!("Claimed drop: {name}");
+                    notify::send(Event::Drop, format!("📦 Claimed drop: **{name}**"));
                 }
                 status => log!(
                     "Claiming drop {name} failed: {}",
@@ -290,6 +304,15 @@ impl Miner {
                 reason_text(reason),
                 fmt_points(st.points)
             );
+            notify::send(
+                Event::Points,
+                format!(
+                    "💰 +{amount} on **{}** from {} - now {} points",
+                    s.login,
+                    reason_text(reason),
+                    fmt_points(st.points)
+                ),
+            );
         }
     }
 
@@ -316,6 +339,14 @@ impl Miner {
                     "OFFLINE  {} went offline - {} points",
                     s.login,
                     fmt_points(st.points)
+                );
+                notify::send(
+                    Event::Offline,
+                    format!(
+                        "🔴 **{}** went offline - {} points",
+                        s.login,
+                        fmt_points(st.points)
+                    ),
                 );
             }
         }
@@ -352,6 +383,15 @@ impl Miner {
                     s.login,
                     st.game_name(),
                     fmt_points(st.points)
+                );
+                notify::send(
+                    Event::Online,
+                    format!(
+                        "🟢 **{}** is now live ({}) - {} points",
+                        s.login,
+                        st.game_name(),
+                        fmt_points(st.points)
+                    ),
                 );
             }
         }
@@ -486,18 +526,18 @@ impl Miner {
         }
     }
 
-    /// Periodic background work: balances as fallback for missed PubSub events,
-    /// and the Client-Version header.
+    /// Periodic background work: polls balances, bonus chests and stream status
+    /// as fallback for missed PubSub events, and refreshes the Client-Version hourly.
     pub async fn refresh_loop(self: Arc<Self>) {
+        let all: Vec<usize> = (0..self.streamers.len()).collect();
+        let mut last_version = Instant::now();
         loop {
-            tokio::time::sleep(Duration::from_secs(30 * 60)).await;
-            let online: Vec<usize> = (0..self.streamers.len())
-                .filter(|&i| self.streamers[i].state().online)
-                .collect();
-            tokio::join!(
-                self.refresh(&online, false),
-                self.api.refresh_client_version()
-            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+            if last_version.elapsed() > Duration::from_secs(3600) {
+                last_version = Instant::now();
+                self.api.refresh_client_version().await;
+            }
+            self.refresh(&all, true).await;
         }
     }
 

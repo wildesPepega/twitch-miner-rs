@@ -16,3 +16,8 @@ blacklist = []
 # claim_moments = true   # claim moments
 # watch_streak  = true   # prefer channels whose watch streak is still missing
 # claim_drops   = true   # claim finished drops from your inventory
+
+# Optional Discord notifications
+# discord_webhook = "https://discord.com/api/webhooks/..."
+# Possible events: online, offline, points, bonus, raid, moment, drop, login, error
+# discord_events = ["online", "offline", "drop", "raid", "login", "error"]
